@@ -1,25 +1,29 @@
-import { useEffect, useState } from 'react';
-import axios from 'axios';
+// src/App.jsx
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';
+import LoginPage from './pages/LoginPage';
+import RegisterPage from './pages/RegisterPage';
+import ChatPage from './pages/ChatPage';
+import ProtectedRoute from './components/ProtectedRoute';
 
 function App() {
-  const [status, setStatus] = useState('Checking backend...');
-
-  useEffect(() => {
-    axios
-      .get(`${import.meta.env.VITE_API_URL}/health`)
-      .then((res) => {
-        setStatus(res.data.message);
-      })
-      .catch(() => {
-        setStatus('Backend not reachable');
-      });
-  }, []);
-
   return (
-    <div style={{ padding: '2rem', fontFamily: 'sans-serif' }}>
-      <h1>ChatApp — Day 1</h1>
-      <p>Backend status: <strong>{status}</strong></p>
-    </div>
+    <BrowserRouter>
+      <Toaster position="top-center" />
+      <Routes>
+        <Route path="/login" element={<LoginPage />} />
+        <Route path="/register" element={<RegisterPage />} />
+        <Route
+          path="/chat"
+          element={
+            <ProtectedRoute>
+              <ChatPage />
+            </ProtectedRoute>
+          }
+        />
+        <Route path="*" element={<Navigate to="/login" replace />} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 
