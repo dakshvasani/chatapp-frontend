@@ -25,8 +25,13 @@ function ChatPage() {
 
   const [allUsers, setAllUsers] = useState([]);
   const [messageText, setMessageText] = useState('');
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [filePreview, setFilePreview] = useState(null);
+  const [isSending, setIsSending] = useState(false);
+
   const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   useInitSocket();
 
@@ -71,30 +76,53 @@ function ChatPage() {
   const getOtherParticipant = (conversation) =>
     conversation.participants.find((p) => p._id !== user.id);
 
+  const handleFileSelect = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    setSelectedFile(file);
+
+    if (file.type.startsWith('image/')) {
+      setFilePreview(URL.createObjectURL(file));
+    } else {
+      setFilePreview(null); // no preview for video/docs, just show filename
+    }
+  };
+
+  const clearSelectedFile = () => {
+    setSelectedFile(null);
+    setFilePreview(null);
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
   const handleSend = async (e) => {
     e.preventDefault();
-    if (!messageText.trim() || !activeConversation) return;
+    if (!messageText.trim() && !selectedFile) return;
+    if (!activeConversation) return;
 
     const receiverId = getOtherParticipant(activeConversation)?._id;
 
-    await axiosInstance.post('/messages', {
-      conversationId: activeConversation._id,
-      text: messageText,
-    });
+    const formData = new FormData();
+    formData.append('conversationId', activeConversation._id);
+    formData.append('text', messageText);
+    if (selectedFile) {
+      formData.append('file', selectedFile); // 'file' must match multer's upload.single('file')
+    }
 
-    // Optimistically add to our own view immediately (sender doesn't get their own socket event)
-    setMessages([
-      ...messages,
-      {
-        conversation: activeConversation._id,
-        sender: { _id: user.id, username: user.username },
-        text: messageText,
-        createdAt: new Date().toISOString(),
-      },
-    ]);
+    try {
+      setIsSending(true);
+      const res = await axiosInstance.post('/messages', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
 
-    setMessageText('');
-    getSocket()?.emit('stop_typing', { receiverId });
+      setMessages([...messages, res.data.message]);
+
+      setMessageText('');
+      clearSelectedFile();
+      getSocket()?.emit('stop_typing', { receiverId });
+    } finally {
+      setIsSending(false);
+    }
   };
 
   const handleTyping = (e) => {
@@ -154,20 +182,67 @@ function ChatPage() {
                     backgroundColor: msg.sender._id === user.id ? '#DCF8C6' : '#fff',
                   }}
                 >
-                  {msg.text}
+                  {msg.media?.url && msg.media.type === 'image' && (
+                    <img
+                      src={msg.media.url}
+                      alt="shared"
+                      style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
+                    />
+                  )}
+                  {msg.media?.url && msg.media.type === 'video' && (
+                    <video
+                      src={msg.media.url}
+                      controls
+                      style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
+                    />
+                  )}
+                  {msg.media?.url && msg.media.type === 'document' && (
+                    <a href={msg.media.url} target="_blank" rel="noopener noreferrer">
+                      📄 {msg.media.fileName}
+                    </a>
+                  )}
+                  {msg.text && (
+                    <div style={{ marginTop: msg.media?.url ? '0.4rem' : 0 }}>{msg.text}</div>
+                  )}
                 </div>
               ))}
               <div ref={messagesEndRef} />
             </div>
 
+            {selectedFile && (
+              <div style={styles.filePreviewBar}>
+                {filePreview ? (
+                  <img
+                    src={filePreview}
+                    alt="preview"
+                    style={{ height: '50px', borderRadius: '4px' }}
+                  />
+                ) : (
+                  <span>📄 {selectedFile.name}</span>
+                )}
+                <button onClick={clearSelectedFile} style={{ marginLeft: '0.5rem' }}>✕</button>
+              </div>
+            )}
+
             <form onSubmit={handleSend} style={styles.inputArea}>
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileSelect}
+                style={{ display: 'none' }}
+                id="fileInput"
+              />
+              <label htmlFor="fileInput" style={styles.attachBtn}>📎</label>
+
               <input
                 value={messageText}
                 onChange={handleTyping}
                 placeholder="Type a message..."
                 style={styles.input}
               />
-              <button type="submit" style={styles.sendBtn}>Send</button>
+              <button type="submit" disabled={isSending} style={styles.sendBtn}>
+                {isSending ? 'Sending...' : 'Send'}
+              </button>
             </form>
           </>
         ) : (
@@ -208,9 +283,28 @@ const styles = {
     borderRadius: '8px',
     maxWidth: '60%',
   },
-  inputArea: { display: 'flex', padding: '1rem', borderTop: '1px solid #ddd', gap: '0.5rem' },
+  inputArea: {
+    display: 'flex',
+    padding: '1rem',
+    borderTop: '1px solid #ddd',
+    gap: '0.5rem',
+    alignItems: 'center',
+  },
   input: { flex: 1, padding: '0.6rem', fontSize: '1rem' },
   sendBtn: { padding: '0.6rem 1.2rem', cursor: 'pointer' },
+  attachBtn: {
+    cursor: 'pointer',
+    fontSize: '1.3rem',
+    display: 'flex',
+    alignItems: 'center',
+    padding: '0 0.5rem',
+  },
+  filePreviewBar: {
+    padding: '0.5rem 1rem',
+    display: 'flex',
+    alignItems: 'center',
+    borderTop: '1px solid #ddd',
+  },
 };
 
 export default ChatPage;
