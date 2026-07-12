@@ -7,8 +7,21 @@ export const useChatStore = create((set, get) => ({
   messages: [],
 
   setConversations: (conversations) => set({ conversations }),
-  setActiveConversation: (conversation) => set({ activeConversation: conversation, messages: [] }),
-  setMessages: (messages) => set({ messages }),
+
+  setActiveConversation: (conversation) =>
+    set({ activeConversation: conversation, messages: [] }),
+
+  // Supports BOTH:
+  //   setMessages(newArray)                — direct replacement
+  //   setMessages((prevMessages) => ...)    — functional update, like React's useState
+  // This matches how the socket event handlers in ChatPage.jsx call it.
+  setMessages: (messagesOrUpdater) =>
+    set((state) => ({
+      messages:
+        typeof messagesOrUpdater === 'function'
+          ? messagesOrUpdater(state.messages)
+          : messagesOrUpdater,
+    })),
 
   addMessage: (message) =>
     set((state) => {

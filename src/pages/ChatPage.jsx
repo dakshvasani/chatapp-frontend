@@ -29,6 +29,13 @@ function ChatPage() {
   const [filePreview, setFilePreview] = useState(null);
   const [isSending, setIsSending] = useState(false);
 
+  // Day 7 additions
+  const [replyingTo, setReplyingTo] = useState(null);
+  const [editingMessage, setEditingMessage] = useState(null);
+  const [editText, setEditText] = useState('');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState(null);
+
   const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const fileInputRef = useRef(null);
@@ -45,7 +52,7 @@ function ChatPage() {
     axiosInstance.get('/conversations').then((res) => setConversations(res.data.conversations));
   }, []);
 
-  // Listen for incoming real-time messages
+  // Single combined socket-listener effect (new_message, messages_seen, message_edited, message_deleted)
   useEffect(() => {
     const socket = getSocket();
     if (!socket) return;
@@ -55,8 +62,35 @@ function ChatPage() {
       updateLastMessage(message.conversation, message);
     };
 
+    const handleMessagesSeen = ({ conversationId }) => {
+      if (activeConversation?._id !== conversationId) return;
+      setMessages((prevMessages) =>
+        prevMessages.map((m) => (m.conversation === conversationId ? { ...m, status: 'seen' } : m))
+      );
+    };
+
+    const handleMessageEdited = (updatedMessage) => {
+      setMessages((prevMessages) =>
+        prevMessages.map((m) => (m._id === updatedMessage._id ? updatedMessage : m))
+      );
+    };
+
+    const handleMessageDeleted = ({ messageId, conversationId }) => {
+      if (activeConversation?._id !== conversationId) return;
+      setMessages((prevMessages) => prevMessages.filter((m) => m._id !== messageId));
+    };
+
     socket.on('new_message', handleNewMessage);
-    return () => socket.off('new_message', handleNewMessage);
+    socket.on('messages_seen', handleMessagesSeen);
+    socket.on('message_edited', handleMessageEdited);
+    socket.on('message_deleted', handleMessageDeleted);
+
+    return () => {
+      socket.off('new_message', handleNewMessage);
+      socket.off('messages_seen', handleMessagesSeen);
+      socket.off('message_edited', handleMessageEdited);
+      socket.off('message_deleted', handleMessageDeleted);
+    };
   }, [activeConversation]);
 
   // Auto-scroll to bottom on new message
@@ -68,13 +102,23 @@ function ChatPage() {
     const res = await axiosInstance.post('/conversations', { participantId: otherUserId });
     const conversation = res.data.conversation;
     setActiveConversation(conversation);
+    setSearchQuery('');
+    setSearchResults(null);
+    setReplyingTo(null);
+    setEditingMessage(null);
 
     const msgRes = await axiosInstance.get(`/messages/${conversation._id}`);
     setMessages(msgRes.data.messages);
+
+    // Tell the backend we've now seen this conversation's messages
+    getSocket()?.emit('mark_seen', { conversationId: conversation._id });
   };
 
+  // Guarded: participants may momentarily be unpopulated ObjectId strings instead of
+  // full user objects (e.g. if a backend route ever returns them unpopulated).
+  // Optional chaining here prevents a full white-screen crash if that happens.
   const getOtherParticipant = (conversation) =>
-    conversation.participants.find((p) => p._id !== user.id);
+    conversation?.participants?.find((p) => p?._id && p._id !== user.id);
 
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
@@ -105,6 +149,9 @@ function ChatPage() {
     const formData = new FormData();
     formData.append('conversationId', activeConversation._id);
     formData.append('text', messageText);
+    if (replyingTo) {
+      formData.append('replyTo', replyingTo._id);
+    }
     if (selectedFile) {
       formData.append('file', selectedFile); // 'file' must match multer's upload.single('file')
     }
@@ -119,7 +166,10 @@ function ChatPage() {
 
       setMessageText('');
       clearSelectedFile();
-      getSocket()?.emit('stop_typing', { receiverId });
+      setReplyingTo(null);
+      if (receiverId) {
+        getSocket()?.emit('stop_typing', { receiverId });
+      }
     } finally {
       setIsSending(false);
     }
@@ -131,7 +181,7 @@ function ChatPage() {
 
     const receiverId = getOtherParticipant(activeConversation)?._id;
     const socket = getSocket();
-    if (!socket) return;
+    if (!socket || !receiverId) return;
 
     socket.emit('typing', { receiverId });
 
@@ -139,6 +189,38 @@ function ChatPage() {
     typingTimeoutRef.current = setTimeout(() => {
       socket.emit('stop_typing', { receiverId });
     }, 1500);
+  };
+
+  const handleEditSave = async () => {
+    if (!editText.trim() || !editingMessage) return;
+
+    const res = await axiosInstance.put(`/messages/${editingMessage._id}`, { text: editText });
+
+    setMessages(messages.map((m) => (m._id === editingMessage._id ? res.data.message : m)));
+
+    setEditingMessage(null);
+    setEditText('');
+  };
+
+  const handleDelete = async (messageId) => {
+    if (!confirm('Delete this message?')) return;
+    await axiosInstance.delete(`/messages/${messageId}`);
+    setMessages(messages.filter((m) => m._id !== messageId));
+  };
+
+  const handleSearch = async (e) => {
+    const query = e.target.value;
+    setSearchQuery(query);
+
+    if (!query.trim()) {
+      setSearchResults(null);
+      return;
+    }
+
+    const res = await axiosInstance.get(`/messages/${activeConversation._id}/search`, {
+      params: { q: query },
+    });
+    setSearchResults(res.data.messages);
   };
 
   return (
@@ -164,50 +246,143 @@ function ChatPage() {
         {activeConversation ? (
           <>
             <div style={styles.chatHeader}>
-              {getOtherParticipant(activeConversation)?.username}
-              {typingUsers[getOtherParticipant(activeConversation)?._id] && (
-                <span style={{ fontSize: '0.85rem', color: '#888', marginLeft: '0.5rem' }}>
-                  typing...
-                </span>
-              )}
+              <span>
+                {getOtherParticipant(activeConversation)?.username || 'Unknown user'}
+                {typingUsers[getOtherParticipant(activeConversation)?._id] && (
+                  <span style={{ fontSize: '0.85rem', color: '#888', marginLeft: '0.5rem' }}>
+                    typing...
+                  </span>
+                )}
+              </span>
+              <input
+                placeholder="Search messages..."
+                value={searchQuery}
+                onChange={handleSearch}
+                style={styles.searchInput}
+              />
             </div>
 
+            {searchResults && (
+              <div style={styles.searchResultsBar}>
+                <strong>{searchResults.length} result(s)</strong>
+                {searchResults.map((m) => (
+                  <div key={m._id} style={{ padding: '0.4rem 0', fontSize: '0.85rem' }}>
+                    <strong>{m.sender?.username || 'Unknown'}:</strong> {m.text}
+                  </div>
+                ))}
+              </div>
+            )}
+
             <div style={styles.messagesArea}>
-              {messages.map((msg, i) => (
-                <div
-                  key={msg._id || i}
-                  style={{
-                    ...styles.messageBubble,
-                    alignSelf: msg.sender._id === user.id ? 'flex-end' : 'flex-start',
-                    backgroundColor: msg.sender._id === user.id ? '#DCF8C6' : '#fff',
-                  }}
-                >
-                  {msg.media?.url && msg.media.type === 'image' && (
-                    <img
-                      src={msg.media.url}
-                      alt="shared"
-                      style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
-                    />
-                  )}
-                  {msg.media?.url && msg.media.type === 'video' && (
-                    <video
-                      src={msg.media.url}
-                      controls
-                      style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
-                    />
-                  )}
-                  {msg.media?.url && msg.media.type === 'document' && (
-                    <a href={msg.media.url} target="_blank" rel="noopener noreferrer">
-                      📄 {msg.media.fileName}
-                    </a>
-                  )}
-                  {msg.text && (
-                    <div style={{ marginTop: msg.media?.url ? '0.4rem' : 0 }}>{msg.text}</div>
-                  )}
-                </div>
-              ))}
+              {messages.map((msg, i) => {
+                const isMine = msg.sender?._id === user.id;
+                return (
+                  <div
+                    key={msg._id || i}
+                    style={{
+                      ...styles.messageBubble,
+                      alignSelf: isMine ? 'flex-end' : 'flex-start',
+                      backgroundColor: isMine ? '#DCF8C6' : '#fff',
+                    }}
+                  >
+                    {msg.replyTo && (
+                      <div style={styles.quotedMessage}>
+                        <div style={{ fontWeight: 'bold', fontSize: '0.75rem' }}>
+                          {msg.replyTo?.sender?.username || 'Unknown'}
+                        </div>
+                        <div style={{ fontSize: '0.8rem', color: '#555' }}>
+                          {msg.replyTo?.text || '📎 Media'}
+                        </div>
+                      </div>
+                    )}
+
+                    {msg.media?.url && msg.media.type === 'image' && (
+                      <img
+                        src={msg.media.url}
+                        alt="shared"
+                        style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
+                      />
+                    )}
+                    {msg.media?.url && msg.media.type === 'video' && (
+                      <video
+                        src={msg.media.url}
+                        controls
+                        style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
+                      />
+                    )}
+                    {msg.media?.url && msg.media.type === 'document' && (
+                      <a href={msg.media.url} target="_blank" rel="noopener noreferrer">
+                        📄 {msg.media.fileName}
+                      </a>
+                    )}
+
+                    {editingMessage?._id === msg._id ? (
+                      <div>
+                        <input
+                          value={editText}
+                          onChange={(e) => setEditText(e.target.value)}
+                          style={{ width: '100%', marginBottom: '0.3rem' }}
+                        />
+                        <button onClick={handleEditSave} style={styles.smallBtn}>Save</button>
+                        <button onClick={() => setEditingMessage(null)} style={styles.smallBtn}>
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      msg.text && (
+                        <div style={{ marginTop: msg.media?.url ? '0.4rem' : 0 }}>
+                          {msg.text}
+                          {msg.isEdited && (
+                            <span style={{ fontSize: '0.65rem', color: '#999' }}> (edited)</span>
+                          )}
+                        </div>
+                      )
+                    )}
+
+                    <div style={styles.messageActions}>
+                      <button onClick={() => setReplyingTo(msg)} style={styles.actionBtn}>
+                        ↩ Reply
+                      </button>
+                      {isMine && (
+                        <>
+                          <button
+                            onClick={() => {
+                              setEditingMessage(msg);
+                              setEditText(msg.text);
+                            }}
+                            style={styles.actionBtn}
+                          >
+                            ✎ Edit
+                          </button>
+                          <button
+                            onClick={() => handleDelete(msg._id)}
+                            style={{ ...styles.actionBtn, color: '#c00' }}
+                          >
+                            🗑 Delete
+                          </button>
+                          <span style={{ fontSize: '0.7rem', color: '#888', marginLeft: '0.4rem' }}>
+                            {msg.status === 'seen' ? '✓✓ Seen' : msg.status === 'delivered' ? '✓✓' : '✓'}
+                          </span>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
               <div ref={messagesEndRef} />
             </div>
+
+            {replyingTo && (
+              <div style={styles.replyPreviewBar}>
+                <div>
+                  <div style={{ fontSize: '0.75rem', color: '#555' }}>
+                    Replying to {replyingTo.sender?.username || 'Unknown'}
+                  </div>
+                  <div style={{ fontSize: '0.85rem' }}>{replyingTo.text || '📎 Media'}</div>
+                </div>
+                <button onClick={() => setReplyingTo(null)}>✕</button>
+              </div>
+            )}
 
             {selectedFile && (
               <div style={styles.filePreviewBar}>
@@ -268,7 +443,26 @@ const styles = {
   logoutBtn: { fontSize: '0.8rem', cursor: 'pointer' },
   userItem: { padding: '0.75rem 1rem', cursor: 'pointer', borderBottom: '1px solid #f0f0f0' },
   chatWindow: { flex: 1, display: 'flex', flexDirection: 'column' },
-  chatHeader: { padding: '1rem', borderBottom: '1px solid #ddd', fontWeight: 'bold' },
+  chatHeader: {
+    padding: '1rem',
+    borderBottom: '1px solid #ddd',
+    fontWeight: 'bold',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  searchInput: {
+    padding: '0.3rem 0.5rem',
+    fontSize: '0.85rem',
+    fontWeight: 'normal',
+  },
+  searchResultsBar: {
+    padding: '1rem',
+    backgroundColor: '#fffbe6',
+    borderBottom: '1px solid #ddd',
+    maxHeight: '160px',
+    overflowY: 'auto',
+  },
   messagesArea: {
     flex: 1,
     padding: '1rem',
@@ -282,6 +476,39 @@ const styles = {
     padding: '0.5rem 0.8rem',
     borderRadius: '8px',
     maxWidth: '60%',
+  },
+  messageActions: {
+    display: 'flex',
+    gap: '0.5rem',
+    marginTop: '0.3rem',
+    alignItems: 'center',
+  },
+  actionBtn: {
+    fontSize: '0.7rem',
+    border: 'none',
+    background: 'none',
+    cursor: 'pointer',
+    color: '#888',
+    padding: 0,
+  },
+  smallBtn: {
+    fontSize: '0.75rem',
+    marginRight: '0.3rem',
+    cursor: 'pointer',
+  },
+  quotedMessage: {
+    borderLeft: '3px solid #34B7F1',
+    paddingLeft: '0.5rem',
+    marginBottom: '0.3rem',
+    opacity: 0.85,
+  },
+  replyPreviewBar: {
+    padding: '0.5rem 1rem',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    borderTop: '1px solid #ddd',
+    backgroundColor: '#f5f5f5',
   },
   inputArea: {
     display: 'flex',
