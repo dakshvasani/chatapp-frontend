@@ -14,6 +14,7 @@ export const useInitSocket = () => {
       disconnectSocket();
       return;
     }
+    
 
     const socket = connectSocket();
     if (!socket) return;

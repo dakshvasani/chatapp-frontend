@@ -4,6 +4,7 @@ import { useNavigate, Link } from 'react-router-dom';
 import toast from 'react-hot-toast';
 import axiosInstance from '../api/axiosInstance';
 import { useAuthStore } from '../store/useAuthStore';
+import { requestNotificationPermission } from '../utils/browserNotification';
 
 function RegisterPage() {
   const navigate = useNavigate();
@@ -27,6 +28,7 @@ function RegisterPage() {
     try {
       const res = await axiosInstance.post('/auth/register', formData);
       setAuth(res.data.user, res.data.accessToken);
+      requestNotificationPermission();
       toast.success('Account created successfully');
       navigate('/chat');
     } catch (err) {
@@ -41,9 +43,14 @@ function RegisterPage() {
   };
 
   return (
-    <div style={styles.container}>
-      <form onSubmit={handleSubmit} style={styles.form}>
-        <h2>Create Account</h2>
+    <div className="flex justify-center items-center h-screen bg-gray-50 dark:bg-gray-900 px-4">
+      <form
+        onSubmit={handleSubmit}
+        className="flex flex-col gap-4 w-full max-w-sm bg-white dark:bg-gray-800 p-8 rounded-lg shadow-md border border-gray-200 dark:border-gray-700"
+      >
+        <h2 className="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-2">
+          Create Account
+        </h2>
 
         <input
           type="text"
@@ -52,7 +59,7 @@ function RegisterPage() {
           value={formData.username}
           onChange={handleChange}
           required
-          style={styles.input}
+          className="p-3 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
         <input
           type="email"
@@ -61,7 +68,7 @@ function RegisterPage() {
           value={formData.email}
           onChange={handleChange}
           required
-          style={styles.input}
+          className="p-3 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
         <input
           type="password"
@@ -70,44 +77,26 @@ function RegisterPage() {
           value={formData.password}
           onChange={handleChange}
           required
-          style={styles.input}
+          className="p-3 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500"
         />
 
-        <button type="submit" disabled={loading} style={styles.button}>
+        <button
+          type="submit"
+          disabled={loading}
+          className="p-3 bg-blue-500 hover:bg-blue-600 disabled:opacity-50 text-white font-semibold rounded transition-colors"
+        >
           {loading ? 'Creating account...' : 'Register'}
         </button>
 
-        <p>
-          Already have an account? <Link to="/login">Login</Link>
+        <p className="text-sm text-gray-600 dark:text-gray-400 text-center">
+          Already have an account?{' '}
+          <Link to="/login" className="text-blue-500 hover:underline">
+            Login
+          </Link>
         </p>
       </form>
     </div>
   );
 }
-
-const styles = {
-  container: {
-    display: 'flex',
-    justifyContent: 'center',
-    alignItems: 'center',
-    height: '100vh',
-    fontFamily: 'sans-serif',
-  },
-  form: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.75rem',
-    width: '320px',
-  },
-  input: {
-    padding: '0.6rem',
-    fontSize: '1rem',
-  },
-  button: {
-    padding: '0.7rem',
-    fontSize: '1rem',
-    cursor: 'pointer',
-  },
-};
 
 export default RegisterPage;

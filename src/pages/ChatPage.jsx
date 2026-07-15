@@ -1,16 +1,21 @@
 // src/pages/ChatPage.jsx
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useRef, useMemo } from 'react';
 import axiosInstance from '../api/axiosInstance';
 import { useAuthStore } from '../store/useAuthStore';
 import { useChatStore } from '../store/useChatStore';
 import { useSocketStore } from '../store/useSocketStore';
+import { useThemeStore } from '../store/useThemeStore';
 import { useInitSocket } from '../hooks/useInitSocket';
-import { getSocket } from '../lib/socket';
+import { playNotificationSound } from '../utils/playNotificationSound';
+import { showBrowserNotification } from '../utils/browserNotification';
+import toast from 'react-hot-toast';
+import { getSocket, disconnectSocket } from '../lib/socket';
 
 function ChatPage() {
   const { user, clearAuth } = useAuthStore();
   const onlineUsers = useSocketStore((state) => state.onlineUsers);
   const typingUsers = useSocketStore((state) => state.typingUsers);
+  const { theme, toggleTheme } = useThemeStore();
 
   const {
     conversations,
@@ -24,10 +29,17 @@ function ChatPage() {
   } = useChatStore();
 
   const [allUsers, setAllUsers] = useState([]);
+  const [loadingConversations, setLoadingConversations] = useState(true);
   const [messageText, setMessageText] = useState('');
   const [selectedFile, setSelectedFile] = useState(null);
   const [filePreview, setFilePreview] = useState(null);
   const [isSending, setIsSending] = useState(false);
+  const [showChatOnMobile, setShowChatOnMobile] = useState(false);
+
+  const handleLogout = () => {
+    disconnectSocket();
+    clearAuth();
+  };
 
   // Day 7 additions
   const [replyingTo, setReplyingTo] = useState(null);
@@ -39,6 +51,7 @@ function ChatPage() {
   const messagesEndRef = useRef(null);
   const typingTimeoutRef = useRef(null);
   const fileInputRef = useRef(null);
+  const searchTimeoutRef = useRef(null);
 
   useInitSocket();
 
@@ -49,7 +62,10 @@ function ChatPage() {
 
   // Fetch existing conversations
   useEffect(() => {
-    axiosInstance.get('/conversations').then((res) => setConversations(res.data.conversations));
+    axiosInstance.get('/conversations').then((res) => {
+      setConversations(res.data.conversations);
+      setLoadingConversations(false);
+    });
   }, []);
 
   // Single combined socket-listener effect (new_message, messages_seen, message_edited, message_deleted)
@@ -60,6 +76,30 @@ function ChatPage() {
     const handleNewMessage = (message) => {
       addMessage(message);
       updateLastMessage(message.conversation, message);
+
+      // Only interrupt the user (toast/sound/browser notification) if this message
+      // is NOT part of the conversation they're currently looking at.
+      const isViewingThisConversation = activeConversation?._id === message.conversation;
+
+      if (isViewingThisConversation) {
+        // We're already looking at this chat — mark it seen immediately, live,
+        // instead of waiting for the user to leave and reopen the conversation.
+        getSocket()?.emit('mark_seen', { conversationId: message.conversation });
+      } else {
+        toast(`New message from ${message.sender?.username || 'Someone'}`, { icon: '💬' });
+        playNotificationSound();
+        showBrowserNotification(`${message.sender?.username || 'New message'}`, {
+          body: message.text || '📎 Sent an attachment',
+        });
+      }
+
+      if (!isViewingThisConversation) {
+        toast(`New message from ${message.sender?.username || 'Someone'}`, { icon: '💬' });
+        playNotificationSound();
+        showBrowserNotification(`${message.sender?.username || 'New message'}`, {
+          body: message.text || '📎 Sent an attachment',
+        });
+      }
     };
 
     const handleMessagesSeen = ({ conversationId }) => {
@@ -98,6 +138,11 @@ function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // Memoized: only recompute when activeConversation or user changes, not on every render
+  const otherParticipant = useMemo(() => {
+    return activeConversation?.participants?.find((p) => p?._id && p._id !== user.id) || null;
+  }, [activeConversation, user.id]);
+
   const openConversation = async (otherUserId) => {
     const res = await axiosInstance.post('/conversations', { participantId: otherUserId });
     const conversation = res.data.conversation;
@@ -106,6 +151,7 @@ function ChatPage() {
     setSearchResults(null);
     setReplyingTo(null);
     setEditingMessage(null);
+    setShowChatOnMobile(true);
 
     const msgRes = await axiosInstance.get(`/messages/${conversation._id}`);
     setMessages(msgRes.data.messages);
@@ -113,12 +159,6 @@ function ChatPage() {
     // Tell the backend we've now seen this conversation's messages
     getSocket()?.emit('mark_seen', { conversationId: conversation._id });
   };
-
-  // Guarded: participants may momentarily be unpopulated ObjectId strings instead of
-  // full user objects (e.g. if a backend route ever returns them unpopulated).
-  // Optional chaining here prevents a full white-screen crash if that happens.
-  const getOtherParticipant = (conversation) =>
-    conversation?.participants?.find((p) => p?._id && p._id !== user.id);
 
   const handleFileSelect = (e) => {
     const file = e.target.files[0];
@@ -144,7 +184,7 @@ function ChatPage() {
     if (!messageText.trim() && !selectedFile) return;
     if (!activeConversation) return;
 
-    const receiverId = getOtherParticipant(activeConversation)?._id;
+    const receiverId = otherParticipant?._id;
 
     const formData = new FormData();
     formData.append('conversationId', activeConversation._id);
@@ -179,7 +219,7 @@ function ChatPage() {
     setMessageText(e.target.value);
     if (!activeConversation) return;
 
-    const receiverId = getOtherParticipant(activeConversation)?._id;
+    const receiverId = otherParticipant?._id;
     const socket = getSocket();
     if (!socket || !receiverId) return;
 
@@ -208,48 +248,92 @@ function ChatPage() {
     setMessages(messages.filter((m) => m._id !== messageId));
   };
 
-  const handleSearch = async (e) => {
+  // Debounced search — waits 400ms after the user stops typing before calling the API
+  const handleSearch = (e) => {
     const query = e.target.value;
     setSearchQuery(query);
+
+    clearTimeout(searchTimeoutRef.current);
 
     if (!query.trim()) {
       setSearchResults(null);
       return;
     }
 
-    const res = await axiosInstance.get(`/messages/${activeConversation._id}/search`, {
-      params: { q: query },
-    });
-    setSearchResults(res.data.messages);
+    searchTimeoutRef.current = setTimeout(async () => {
+      const res = await axiosInstance.get(`/messages/${activeConversation._id}/search`, {
+        params: { q: query },
+      });
+      setSearchResults(res.data.messages);
+    }, 400);
   };
 
   return (
-    <div style={styles.container}>
+    <div className="flex h-screen bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100">
       {/* Sidebar */}
-      <div style={styles.sidebar}>
-        <div style={styles.sidebarHeader}>
-          <strong>{user?.username}</strong>
-          <button onClick={clearAuth} style={styles.logoutBtn}>Logout</button>
+      <div
+        className={`w-full md:w-80 border-r border-gray-200 dark:border-gray-700 overflow-y-auto ${
+          showChatOnMobile ? 'hidden md:block' : 'block'
+        }`}
+      >
+        <div className="flex justify-between items-center p-4 border-b border-gray-200 dark:border-gray-700">
+          <strong className="text-gray-900 dark:text-gray-100">{user?.username}</strong>
+          <div className="flex items-center gap-3">
+            <button onClick={toggleTheme} className="text-lg leading-none" title="Toggle theme">
+              {theme === 'dark' ? '☀️' : '🌙'}
+            </button>
+            <button
+              onClick={handleLogout}
+              className="text-sm text-gray-600 dark:text-gray-300 hover:underline"
+            >
+              Logout
+            </button>
+          </div>
         </div>
 
-        <h4 style={{ padding: '0 1rem' }}>All Users</h4>
-        {allUsers.map((u) => (
-          <div key={u._id} style={styles.userItem} onClick={() => openConversation(u._id)}>
-            <span style={{ color: onlineUsers.includes(u._id) ? 'green' : '#999' }}>●</span>{' '}
-            {u.username}
+        <h4 className="px-4 pt-3 pb-1 text-sm font-semibold text-gray-500 dark:text-gray-400">
+          All Users
+        </h4>
+
+        {loadingConversations ? (
+          <div className="p-4 space-y-3">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="h-4 bg-gray-200 dark:bg-gray-700 rounded animate-pulse" />
+            ))}
           </div>
-        ))}
+        ) : (
+          allUsers.map((u) => (
+            <div
+              key={u._id}
+              onClick={() => openConversation(u._id)}
+              className="p-3 cursor-pointer border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800"
+            >
+              <span className={onlineUsers.includes(u._id) ? 'text-green-500' : 'text-gray-400'}>
+                ●
+              </span>{' '}
+              <span className="text-gray-800 dark:text-gray-200">{u.username}</span>
+            </div>
+          ))
+        )}
       </div>
 
       {/* Chat window */}
-      <div style={styles.chatWindow}>
+      <div
+        className={`flex-1 flex-col ${showChatOnMobile ? 'flex' : 'hidden md:flex'}`}
+      >
         {activeConversation ? (
           <>
-            <div style={styles.chatHeader}>
-              <span>
-                {getOtherParticipant(activeConversation)?.username || 'Unknown user'}
-                {typingUsers[getOtherParticipant(activeConversation)?._id] && (
-                  <span style={{ fontSize: '0.85rem', color: '#888', marginLeft: '0.5rem' }}>
+            <div className="flex justify-between items-center p-4 border-b border-gray-200 dark:border-gray-700 font-bold">
+              <span className="flex items-center">
+                <button
+                  onClick={() => setShowChatOnMobile(false)}
+                  className="md:hidden mr-2 text-lg font-normal"
+                >
+                  ←
+                </button>
+                {otherParticipant?.username || 'Unknown user'}
+                {typingUsers[otherParticipant?._id] && (
+                  <span className="text-sm text-gray-500 dark:text-gray-400 ml-2 font-normal">
                     typing...
                   </span>
                 )}
@@ -258,39 +342,39 @@ function ChatPage() {
                 placeholder="Search messages..."
                 value={searchQuery}
                 onChange={handleSearch}
-                style={styles.searchInput}
+                className="px-2 py-1 text-sm font-normal rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
               />
             </div>
 
             {searchResults && (
-              <div style={styles.searchResultsBar}>
+              <div className="p-4 bg-yellow-50 dark:bg-yellow-900/30 border-b border-gray-200 dark:border-gray-700 max-h-40 overflow-y-auto">
                 <strong>{searchResults.length} result(s)</strong>
                 {searchResults.map((m) => (
-                  <div key={m._id} style={{ padding: '0.4rem 0', fontSize: '0.85rem' }}>
+                  <div key={m._id} className="py-1 text-sm">
                     <strong>{m.sender?.username || 'Unknown'}:</strong> {m.text}
                   </div>
                 ))}
               </div>
             )}
 
-            <div style={styles.messagesArea}>
+            <div className="flex-1 p-4 flex flex-col gap-2 overflow-y-auto bg-[#ECE5DD] dark:bg-gray-800">
               {messages.map((msg, i) => {
                 const isMine = msg.sender?._id === user.id;
                 return (
                   <div
                     key={msg._id || i}
-                    style={{
-                      ...styles.messageBubble,
-                      alignSelf: isMine ? 'flex-end' : 'flex-start',
-                      backgroundColor: isMine ? '#DCF8C6' : '#fff',
-                    }}
+                    className={`px-3 py-2 rounded-lg max-w-[75%] md:max-w-[60%] ${
+                      isMine
+                        ? 'self-end bg-green-100 dark:bg-green-900'
+                        : 'self-start bg-white dark:bg-gray-700'
+                    }`}
                   >
                     {msg.replyTo && (
-                      <div style={styles.quotedMessage}>
-                        <div style={{ fontWeight: 'bold', fontSize: '0.75rem' }}>
+                      <div className="border-l-[3px] border-sky-400 pl-2 mb-1 opacity-85">
+                        <div className="font-bold text-xs">
                           {msg.replyTo?.sender?.username || 'Unknown'}
                         </div>
-                        <div style={{ fontSize: '0.8rem', color: '#555' }}>
+                        <div className="text-sm text-gray-600 dark:text-gray-300">
                           {msg.replyTo?.text || '📎 Media'}
                         </div>
                       </div>
@@ -300,18 +384,23 @@ function ChatPage() {
                       <img
                         src={msg.media.url}
                         alt="shared"
-                        style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
+                        className="max-w-[220px] rounded-md block"
                       />
                     )}
                     {msg.media?.url && msg.media.type === 'video' && (
                       <video
                         src={msg.media.url}
                         controls
-                        style={{ maxWidth: '220px', borderRadius: '6px', display: 'block' }}
+                        className="max-w-[220px] rounded-md block"
                       />
                     )}
                     {msg.media?.url && msg.media.type === 'document' && (
-                      <a href={msg.media.url} target="_blank" rel="noopener noreferrer">
+                      <a
+                        href={msg.media.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="underline text-blue-600 dark:text-blue-400"
+                      >
                         📄 {msg.media.fileName}
                       </a>
                     )}
@@ -321,26 +410,37 @@ function ChatPage() {
                         <input
                           value={editText}
                           onChange={(e) => setEditText(e.target.value)}
-                          style={{ width: '100%', marginBottom: '0.3rem' }}
+                          className="w-full mb-1 px-2 py-1 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
                         />
-                        <button onClick={handleEditSave} style={styles.smallBtn}>Save</button>
-                        <button onClick={() => setEditingMessage(null)} style={styles.smallBtn}>
+                        <button
+                          onClick={handleEditSave}
+                          className="text-xs mr-2 px-2 py-1 bg-blue-500 text-white rounded"
+                        >
+                          Save
+                        </button>
+                        <button
+                          onClick={() => setEditingMessage(null)}
+                          className="text-xs px-2 py-1 bg-gray-300 dark:bg-gray-600 rounded"
+                        >
                           Cancel
                         </button>
                       </div>
                     ) : (
                       msg.text && (
-                        <div style={{ marginTop: msg.media?.url ? '0.4rem' : 0 }}>
+                        <div className={msg.media?.url ? 'mt-1' : ''}>
                           {msg.text}
                           {msg.isEdited && (
-                            <span style={{ fontSize: '0.65rem', color: '#999' }}> (edited)</span>
+                            <span className="text-xs text-gray-400 dark:text-gray-500"> (edited)</span>
                           )}
                         </div>
                       )
                     )}
 
-                    <div style={styles.messageActions}>
-                      <button onClick={() => setReplyingTo(msg)} style={styles.actionBtn}>
+                    <div className="flex gap-2 mt-1 items-center">
+                      <button
+                        onClick={() => setReplyingTo(msg)}
+                        className="text-xs text-gray-500 dark:text-gray-400 hover:underline"
+                      >
                         ↩ Reply
                       </button>
                       {isMine && (
@@ -350,17 +450,17 @@ function ChatPage() {
                               setEditingMessage(msg);
                               setEditText(msg.text);
                             }}
-                            style={styles.actionBtn}
+                            className="text-xs text-gray-500 dark:text-gray-400 hover:underline"
                           >
                             ✎ Edit
                           </button>
                           <button
                             onClick={() => handleDelete(msg._id)}
-                            style={{ ...styles.actionBtn, color: '#c00' }}
+                            className="text-xs text-red-600 dark:text-red-400 hover:underline"
                           >
                             🗑 Delete
                           </button>
-                          <span style={{ fontSize: '0.7rem', color: '#888', marginLeft: '0.4rem' }}>
+                          <span className="text-xs text-gray-400 dark:text-gray-500 ml-1">
                             {msg.status === 'seen' ? '✓✓ Seen' : msg.status === 'delivered' ? '✓✓' : '✓'}
                           </span>
                         </>
@@ -373,55 +473,64 @@ function ChatPage() {
             </div>
 
             {replyingTo && (
-              <div style={styles.replyPreviewBar}>
+              <div className="flex justify-between items-center p-3 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-800">
                 <div>
-                  <div style={{ fontSize: '0.75rem', color: '#555' }}>
+                  <div className="text-xs text-gray-500 dark:text-gray-400">
                     Replying to {replyingTo.sender?.username || 'Unknown'}
                   </div>
-                  <div style={{ fontSize: '0.85rem' }}>{replyingTo.text || '📎 Media'}</div>
+                  <div className="text-sm">{replyingTo.text || '📎 Media'}</div>
                 </div>
-                <button onClick={() => setReplyingTo(null)}>✕</button>
+                <button onClick={() => setReplyingTo(null)} className="text-gray-500 dark:text-gray-400">
+                  ✕
+                </button>
               </div>
             )}
 
             {selectedFile && (
-              <div style={styles.filePreviewBar}>
+              <div className="flex items-center p-3 border-t border-gray-200 dark:border-gray-700">
                 {filePreview ? (
-                  <img
-                    src={filePreview}
-                    alt="preview"
-                    style={{ height: '50px', borderRadius: '4px' }}
-                  />
+                  <img src={filePreview} alt="preview" className="h-12 rounded" />
                 ) : (
-                  <span>📄 {selectedFile.name}</span>
+                  <span className="text-sm">📄 {selectedFile.name}</span>
                 )}
-                <button onClick={clearSelectedFile} style={{ marginLeft: '0.5rem' }}>✕</button>
+                <button onClick={clearSelectedFile} className="ml-2 text-gray-500 dark:text-gray-400">
+                  ✕
+                </button>
               </div>
             )}
 
-            <form onSubmit={handleSend} style={styles.inputArea}>
+            <form
+              onSubmit={handleSend}
+              className="flex items-center gap-2 p-4 border-t border-gray-200 dark:border-gray-700"
+            >
               <input
                 type="file"
                 ref={fileInputRef}
                 onChange={handleFileSelect}
-                style={{ display: 'none' }}
+                className="hidden"
                 id="fileInput"
               />
-              <label htmlFor="fileInput" style={styles.attachBtn}>📎</label>
+              <label htmlFor="fileInput" className="cursor-pointer text-xl px-1">
+                📎
+              </label>
 
               <input
                 value={messageText}
                 onChange={handleTyping}
                 placeholder="Type a message..."
-                style={styles.input}
+                className="flex-1 p-2 rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
               />
-              <button type="submit" disabled={isSending} style={styles.sendBtn}>
+              <button
+                type="submit"
+                disabled={isSending}
+                className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 disabled:opacity-50"
+              >
                 {isSending ? 'Sending...' : 'Send'}
               </button>
             </form>
           </>
         ) : (
-          <div style={{ padding: '2rem', color: '#888' }}>
+          <div className="p-8 text-gray-400 dark:text-gray-500">
             Select a user to start chatting
           </div>
         )}
@@ -429,109 +538,5 @@ function ChatPage() {
     </div>
   );
 }
-
-const styles = {
-  container: { display: 'flex', height: '100vh', fontFamily: 'sans-serif' },
-  sidebar: { width: '280px', borderRight: '1px solid #ddd', overflowY: 'auto' },
-  sidebarHeader: {
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    padding: '1rem',
-    borderBottom: '1px solid #ddd',
-  },
-  logoutBtn: { fontSize: '0.8rem', cursor: 'pointer' },
-  userItem: { padding: '0.75rem 1rem', cursor: 'pointer', borderBottom: '1px solid #f0f0f0' },
-  chatWindow: { flex: 1, display: 'flex', flexDirection: 'column' },
-  chatHeader: {
-    padding: '1rem',
-    borderBottom: '1px solid #ddd',
-    fontWeight: 'bold',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-  },
-  searchInput: {
-    padding: '0.3rem 0.5rem',
-    fontSize: '0.85rem',
-    fontWeight: 'normal',
-  },
-  searchResultsBar: {
-    padding: '1rem',
-    backgroundColor: '#fffbe6',
-    borderBottom: '1px solid #ddd',
-    maxHeight: '160px',
-    overflowY: 'auto',
-  },
-  messagesArea: {
-    flex: 1,
-    padding: '1rem',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '0.5rem',
-    overflowY: 'auto',
-    backgroundColor: '#ECE5DD',
-  },
-  messageBubble: {
-    padding: '0.5rem 0.8rem',
-    borderRadius: '8px',
-    maxWidth: '60%',
-  },
-  messageActions: {
-    display: 'flex',
-    gap: '0.5rem',
-    marginTop: '0.3rem',
-    alignItems: 'center',
-  },
-  actionBtn: {
-    fontSize: '0.7rem',
-    border: 'none',
-    background: 'none',
-    cursor: 'pointer',
-    color: '#888',
-    padding: 0,
-  },
-  smallBtn: {
-    fontSize: '0.75rem',
-    marginRight: '0.3rem',
-    cursor: 'pointer',
-  },
-  quotedMessage: {
-    borderLeft: '3px solid #34B7F1',
-    paddingLeft: '0.5rem',
-    marginBottom: '0.3rem',
-    opacity: 0.85,
-  },
-  replyPreviewBar: {
-    padding: '0.5rem 1rem',
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    borderTop: '1px solid #ddd',
-    backgroundColor: '#f5f5f5',
-  },
-  inputArea: {
-    display: 'flex',
-    padding: '1rem',
-    borderTop: '1px solid #ddd',
-    gap: '0.5rem',
-    alignItems: 'center',
-  },
-  input: { flex: 1, padding: '0.6rem', fontSize: '1rem' },
-  sendBtn: { padding: '0.6rem 1.2rem', cursor: 'pointer' },
-  attachBtn: {
-    cursor: 'pointer',
-    fontSize: '1.3rem',
-    display: 'flex',
-    alignItems: 'center',
-    padding: '0 0.5rem',
-  },
-  filePreviewBar: {
-    padding: '0.5rem 1rem',
-    display: 'flex',
-    alignItems: 'center',
-    borderTop: '1px solid #ddd',
-  },
-};
 
 export default ChatPage;
